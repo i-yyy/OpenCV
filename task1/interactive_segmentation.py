@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import math
 import sys
+import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Iterable
 
@@ -57,7 +59,23 @@ TOOL_LABELS = {
     "polygon": "任意多边形",
 }
 
-VIEW_MODES = ("叠加结果", "原图", "前景图")
+UI_FONT_FAMILY = "Microsoft YaHei"
+ANNOTATION_FONT_CANDIDATES = (
+    Path("C:/Windows/Fonts/msyh.ttc"),
+    Path("C:/Windows/Fonts/msyh.ttf"),
+    Path("C:/Windows/Fonts/msyhbd.ttc"),
+)
+
+
+def load_annotation_font(size: int = 16) -> ImageFont.ImageFont:
+    # 图片上的时间、交互次数标注使用微软雅黑，避免 PIL 默认位图字体放大后发虚。
+    for font_path in ANNOTATION_FONT_CANDIDATES:
+        if font_path.exists():
+            return ImageFont.truetype(str(font_path), size)
+    try:
+        return ImageFont.truetype("msyh.ttc", size)
+    except OSError:
+        return ImageFont.load_default()
 
 
 def require_cv2():
@@ -136,6 +154,189 @@ def expand_initial_foreground_from_marks(
     return output, not np.array_equal(before, output)
 
 
+def enhance_bright_line_details(
+    image_rgb: np.ndarray,
+    result_mask: np.ndarray,
+    seed_mask: np.ndarray,
+    alpha_mask: np.ndarray | None = None,
+    blocked_mask: np.ndarray | None = None,
+    search_kernel_size: int = 41,
+    detail_kernel_size: int = 9,
+    bright_threshold: int = 18,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+    """在人工前景笔画附近增强胡须、发丝一类明亮细线。"""
+    cv2 = require_cv2()
+    if image_rgb.ndim != 3 or image_rgb.shape[2] != 3:
+        raise ValueError("image_rgb must be an HxWx3 RGB image")
+    if result_mask.shape != image_rgb.shape[:2] or seed_mask.shape != result_mask.shape:
+        raise ValueError("mask shapes must match the image")
+
+    seed = seed_mask.astype(bool)
+    if not np.any(seed):
+        base_alpha = result_mask if alpha_mask is None else alpha_mask
+        empty = np.zeros_like(result_mask, dtype=np.uint8)
+        return result_mask.copy(), base_alpha.copy(), empty, 0
+
+    search_kernel_size = max(5, int(search_kernel_size))
+    if search_kernel_size % 2 == 0:
+        search_kernel_size += 1
+    detail_kernel_size = max(3, int(detail_kernel_size))
+    if detail_kernel_size % 2 == 0:
+        detail_kernel_size += 1
+
+    seed_u8 = (seed.astype(np.uint8) * 255)
+    search_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (search_kernel_size, search_kernel_size))
+    search_area = cv2.dilate(seed_u8, search_kernel, iterations=1) > 0
+    if blocked_mask is not None:
+        search_area &= ~blocked_mask.astype(bool)
+
+    gray = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2GRAY)
+    blurred = cv2.GaussianBlur(gray, (0, 0), 3)
+    contrast = cv2.subtract(gray, blurred)
+    line_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (detail_kernel_size, detail_kernel_size))
+    tophat = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, line_kernel)
+    edges = cv2.Canny(gray, 40, 120)
+
+    _, bright_lines = cv2.threshold(tophat, int(bright_threshold), 255, cv2.THRESH_BINARY)
+    contrast_lines = (contrast > max(8, bright_threshold // 2)) & (gray > 80)
+    candidate = (
+        (bright_lines > 0)
+        | ((edges > 0) & (tophat > max(8, bright_threshold // 2)))
+        | contrast_lines
+    ) & search_area
+
+    connect_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    candidate_u8 = cv2.morphologyEx(candidate.astype(np.uint8) * 255, cv2.MORPH_CLOSE, connect_kernel)
+    labels_count, labels, stats, _centroids = cv2.connectedComponentsWithStats(candidate_u8, connectivity=8)
+    near_seed_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (17, 17))
+    near_seed = cv2.dilate(seed_u8, near_seed_kernel, iterations=1) > 0
+
+    filtered = np.zeros_like(candidate_u8)
+    for label in range(1, labels_count):
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        width = int(stats[label, cv2.CC_STAT_WIDTH])
+        height = int(stats[label, cv2.CC_STAT_HEIGHT])
+        if area < 2 or area > 8000:
+            continue
+        component = labels == label
+        aspect = max(width, height) / max(1, min(width, height))
+        fill_ratio = area / max(1, width * height)
+        thin_component = aspect >= 2.0 or fill_ratio <= 0.45
+        touches_seed = bool(np.any(component & near_seed))
+        bright_fraction = float(np.count_nonzero((tophat > max(8, bright_threshold // 2)) & component)) / float(area)
+        mean_contrast = float(np.mean(contrast[component]))
+        dense_detail = touches_seed and (bright_fraction >= 0.08 or mean_contrast >= 6.0)
+        if thin_component or dense_detail:
+            filtered[component] = 255
+
+    added = filtered > 0
+    output_mask = result_mask.copy()
+    output_mask[added] = 255
+
+    output_alpha = result_mask.copy() if alpha_mask is None else alpha_mask.copy()
+    line_alpha = np.clip(tophat[added].astype(np.uint16) * 4, 210, 255).astype(np.uint8)
+    output_alpha[added] = np.maximum(output_alpha[added], line_alpha)
+    output_alpha[output_mask == 0] = 0
+    return output_mask.astype(np.uint8), output_alpha.astype(np.uint8), filtered.astype(np.uint8), int(np.count_nonzero(added))
+
+
+def edge_watershed_segment(
+    image_rgb: np.ndarray,
+    grabcut_mask: np.ndarray,
+    current_mask: np.ndarray | None = None,
+    manual_mask: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """基于 Canny 边缘和分水岭的 CPU 分割，用于和 GrabCut / 模型结果做消融对比。"""
+    cv2 = require_cv2()
+    if image_rgb.ndim != 3 or image_rgb.shape[2] != 3:
+        raise ValueError("image_rgb must be an HxWx3 RGB image")
+    if grabcut_mask.shape != image_rgb.shape[:2]:
+        raise ValueError("grabcut_mask shape must match the image")
+
+    height, width = image_rgb.shape[:2]
+    image_area = max(1, height * width)
+
+    if current_mask is not None and current_mask.shape == (height, width) and np.any(current_mask > 0):
+        candidate = current_mask > 0
+    else:
+        candidate = (grabcut_mask == GC_FGD) | (grabcut_mask == GC_PR_FGD)
+    if not np.any(candidate):
+        candidate = make_default_mask(width, height) == GC_PR_FGD
+
+    manual_fg = np.zeros((height, width), dtype=bool)
+    manual_bg = np.zeros((height, width), dtype=bool)
+    if manual_mask is not None and manual_mask.shape == (height, width):
+        manual_fg = (manual_mask == GC_FGD) | (manual_mask == GC_PR_FGD)
+        manual_bg = (manual_mask == GC_BGD) | (manual_mask == GC_PR_BGD)
+
+    gray = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2GRAY)
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+    median = float(np.median(gray))
+    low = int(max(10, 0.66 * median))
+    high = int(min(255, max(low + 20, 1.33 * median)))
+    edges = cv2.Canny(gray, low, high)
+
+    # 从当前候选前景内部提取较可靠的前景种子，避免矩形框整体直接变成前景。
+    sure_fg = manual_fg.copy()
+    candidate_u8 = candidate.astype(np.uint8) * 255
+    labels_count, labels, stats, _centroids = cv2.connectedComponentsWithStats(candidate_u8, connectivity=8)
+    for label in range(1, labels_count):
+        component = labels == label
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        if area < max(8, image_area // 20000):
+            continue
+        distance = cv2.distanceTransform(component.astype(np.uint8), cv2.DIST_L2, 5)
+        max_distance = float(distance.max())
+        if max_distance > 1.0:
+            sure_fg |= distance >= max(1.0, max_distance * 0.35)
+        else:
+            sure_fg |= component
+
+    if not np.any(sure_fg):
+        sure_fg = candidate.copy()
+
+    candidate_kernel_size = max(9, int(min(height, width) * 0.035))
+    if candidate_kernel_size % 2 == 0:
+        candidate_kernel_size += 1
+    candidate_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (candidate_kernel_size, candidate_kernel_size)
+    )
+    allowed_area = cv2.dilate(candidate_u8, candidate_kernel, iterations=1) > 0
+
+    sure_bg = (~allowed_area) | manual_bg
+    sure_bg[:2, :] = True
+    sure_bg[-2:, :] = True
+    sure_bg[:, :2] = True
+    sure_bg[:, -2:] = True
+
+    sure_fg &= ~sure_bg
+    unknown = ~(sure_fg | sure_bg)
+
+    fg_labels_count, markers = cv2.connectedComponents(sure_fg.astype(np.uint8), connectivity=8)
+    markers = markers.astype(np.int32) + 1
+    markers[sure_bg] = 1
+    markers[unknown] = 0
+
+    # 分水岭在梯度图上更容易沿真实边缘收敛。
+    sobel_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    sobel_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    gradient = cv2.magnitude(sobel_x, sobel_y)
+    gradient = cv2.normalize(gradient, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    gradient[edges > 0] = 255
+    watershed_source = cv2.cvtColor(gradient, cv2.COLOR_GRAY2BGR)
+
+    cv2.watershed(watershed_source, markers)
+    result = (markers > 1) & allowed_area
+    result[manual_fg] = True
+    result[manual_bg] = False
+
+    if not np.any(result):
+        result = candidate & ~manual_bg
+
+    result_mask = (result.astype(np.uint8) * 255)
+    return result_mask.astype(np.uint8), edges.astype(np.uint8), max(0, fg_labels_count - 1)
+
+
 def postprocess_binary_mask(
     mask: np.ndarray,
     use_opening: bool = True,
@@ -209,6 +410,7 @@ class DisplayGeometry:
 class MarkUndoState:
     grabcut_mask: np.ndarray | None
     result_mask: np.ndarray | None
+    alpha_mask: np.ndarray | None
     manual_mask: np.ndarray | None
     visual_marks: np.ndarray | None
     pending_visual_marks: np.ndarray | None
@@ -223,12 +425,13 @@ class InteractiveSegmentationApp:
         self.root = root
         self.root.title("交互式图像分割")
         self.root.geometry("1320x820")
-        self.root.minsize(1060, 660)
+        self.root.minsize(1180, 720)
 
         self.image_path: Path | None = None
         self.image_rgb: np.ndarray | None = None
         self.grabcut_mask: np.ndarray | None = None
         self.result_mask: np.ndarray | None = None
+        self.alpha_mask: np.ndarray | None = None
         self.manual_mask: np.ndarray | None = None
         self.visual_marks: np.ndarray | None = None
         self.pending_visual_marks: np.ndarray | None = None
@@ -245,6 +448,9 @@ class InteractiveSegmentationApp:
         self.pending_edits = False
         self.last_saved_files: list[Path] = []
         self.mark_undo_stack: list[MarkUndoState] = []
+        self.model_sessions: dict[str, object] = {}
+        self.model_lock = threading.Lock()
+        self.model_running = False
         self.main_zoom = 1.0
         self.main_pan_x = 0
         self.main_pan_y = 0
@@ -252,8 +458,10 @@ class InteractiveSegmentationApp:
 
         self.tool_var = tk.StringVar(value="brush")
         self.mark_mode_var = tk.StringVar(value="前景")
-        self.view_var = tk.StringVar(value="叠加结果")
         self.zoom_label_var = tk.StringVar(value="100%")
+        self.time_badge_var = tk.StringVar(value="0.0 s")
+        self.interaction_badge_var = tk.StringVar(value="交互 0 次")
+        self.canvas_state_var = tk.StringVar(value="等待操作")
         self.brush_size_var = tk.IntVar(value=15)
         self.iterations_var = tk.IntVar(value=1)
         self.use_opening_var = tk.BooleanVar(value=True)
@@ -270,6 +478,7 @@ class InteractiveSegmentationApp:
         self.action_grabcut_before: np.ndarray | None = None
         self.action_visual_before: np.ndarray | None = None
         self.action_result_before: np.ndarray | None = None
+        self.action_alpha_before: np.ndarray | None = None
         self.action_manual_before: np.ndarray | None = None
         self.action_pending_before: np.ndarray | None = None
         self.action_pending_edits_before = False
@@ -283,111 +492,351 @@ class InteractiveSegmentationApp:
         self._bind_canvas()
         self._load_default_sample()
 
+    def _configure_style(self) -> None:
+        style = ttk.Style(self.root)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+
+        base_font = (UI_FONT_FAMILY, 9)
+        title_font = (UI_FONT_FAMILY, 9, "bold")
+        style.configure(".", font=base_font)
+        style.configure("Sidebar.TFrame", background="#eef2f6")
+        style.configure("Workspace.TFrame", background="#eef2f6")
+        style.configure("Panel.TLabelframe", background="#eef2f6", bordercolor="#cbd5e1", relief="solid")
+        style.configure("Panel.TLabelframe.Label", background="#eef2f6", foreground="#1f2937", font=title_font)
+        style.configure("TLabel", background="#eef2f6", foreground="#1f2937")
+        style.configure("Muted.TLabel", background="#eef2f6", foreground="#64748b")
+        style.configure("TButton", padding=(8, 5), background="#f8fafc", foreground="#111827", bordercolor="#cbd5e1")
+        style.map("TButton", background=[("active", "#e2e8f0")])
+        style.configure("Primary.TButton", padding=(8, 7), background="#2563eb", foreground="#ffffff", font=title_font)
+        style.map("Primary.TButton", background=[("active", "#1d4ed8")], foreground=[("active", "#ffffff")])
+        style.configure("Danger.TButton", background="#fff1f2", foreground="#be123c")
+        style.map("Danger.TButton", background=[("active", "#ffe4e6")])
+        style.configure("TRadiobutton", background="#eef2f6", foreground="#1f2937")
+        style.configure("TCheckbutton", background="#eef2f6", foreground="#1f2937")
+
+    def _bubble_panel(self, parent: tk.Misc, padding: int | tuple[int, ...] = 12) -> tk.Frame:
+        # Tkinter 不支持原生圆角卡片，这里用浅边框、留白和白色背景模拟轻盈气泡卡片。
+        panel = tk.Frame(
+            parent,
+            bg="#ffffff",
+            bd=0,
+            highlightthickness=1,
+            highlightbackground="#e8ecf3",
+            highlightcolor="#dbe5f2",
+            padx=padding if isinstance(padding, int) else 0,
+            pady=padding if isinstance(padding, int) else 0,
+        )
+        if not isinstance(padding, int):
+            left, top, right, bottom = padding
+            panel.configure(padx=max(left, right), pady=max(top, bottom))
+        return panel
+
+    def _section_title(self, parent: tk.Misc, text: str, row: int, column: int = 0, columnspan: int = 1) -> None:
+        tk.Label(
+            parent,
+            text=text,
+            bg="#ffffff",
+            fg="#263238",
+            font=(UI_FONT_FAMILY, 10, "bold"),
+        ).grid(row=row, column=column, columnspan=columnspan, sticky="w", pady=(0, 8))
+
+    def _action_button(
+        self,
+        parent: tk.Misc,
+        text: str,
+        command,
+        variant: str = "secondary",
+    ) -> tk.Button:
+        colors = {
+            "primary": ("#5b7cfa", "#ffffff", "#4f6ff0"),
+            "accent": ("#e8fbff", "#16798a", "#d8f6fc"),
+            "secondary": ("#f3f6fb", "#263238", "#e8eef8"),
+            "danger": ("#fff1f3", "#d6455d", "#ffe1e6"),
+        }
+        bg, fg, active_bg = colors.get(variant, colors["secondary"])
+        return tk.Button(
+            parent,
+            text=text,
+            command=command,
+            bg=bg,
+            fg=fg,
+            activebackground=active_bg,
+            activeforeground=fg,
+            relief="flat",
+            bd=0,
+            cursor="hand2",
+            padx=10,
+            pady=6,
+            font=(UI_FONT_FAMILY, 9, "bold" if variant == "primary" else "normal"),
+        )
+
+    def _tool_toggle(self, parent: tk.Misc, text: str, value: str, variable: tk.StringVar) -> tk.Radiobutton:
+        return tk.Radiobutton(
+            parent,
+            text=text,
+            value=value,
+            variable=variable,
+            command=self._cancel_polygon,
+            indicatoron=False,
+            selectcolor="#eaf3ff",
+            bg="#f3f6fb",
+            fg="#263238",
+            activebackground="#edf2ff",
+            activeforeground="#263238",
+            relief="flat",
+            bd=0,
+            cursor="hand2",
+            padx=6,
+            pady=5,
+            font=(UI_FONT_FAMILY, 8),
+        )
+
+    def _badge(self, parent: tk.Misc, textvariable: tk.StringVar, bg: str = "#eef4ff", fg: str = "#4f63b5") -> tk.Label:
+        return tk.Label(
+            parent,
+            textvariable=textvariable,
+            bg=bg,
+            fg=fg,
+            padx=12,
+            pady=6,
+            font=(UI_FONT_FAMILY, 9, "bold"),
+        )
+
+    def _refresh_header_badges(self) -> None:
+        self.time_badge_var.set(f"⏱ {self.operation_seconds:.1f} s")
+        self.interaction_badge_var.set(f"✦ 交互 {self.segmentation_count} 次")
+        if self.image_rgb is None:
+            self.canvas_state_var.set("等待图片")
+        elif self.model_running:
+            self.canvas_state_var.set("模型处理中")
+        elif self.result_mask is None:
+            self.canvas_state_var.set("等待分割")
+        elif self.pending_edits:
+            self.canvas_state_var.set("待更新")
+        else:
+            self.canvas_state_var.set("已分割")
+
     def _build_ui(self) -> None:
+        self._configure_style()
+        self.root.configure(bg="#f5f7fb")
+        self.root.columnconfigure(0, weight=0)
         self.root.columnconfigure(1, weight=1)
-        self.root.rowconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=0)
+        self.root.rowconfigure(1, weight=1)
 
-        sidebar = ttk.Frame(self.root, padding=10)
-        sidebar.grid(row=0, column=0, sticky="ns")
+        # 顶部 Header 使用一整块白色气泡卡片承载标题、文件操作和状态徽章。
+        header = self._bubble_panel(self.root, padding=14)
+        header.grid(row=0, column=0, columnspan=2, sticky="ew", padx=16, pady=(16, 8))
+        header.columnconfigure(1, weight=1)
 
-        ttk.Button(sidebar, text="读取图像", command=self.open_image).pack(fill="x", pady=(0, 6))
-        ttk.Button(sidebar, text="保存结果", command=self.save_results).pack(fill="x", pady=(0, 6))
-        ttk.Button(sidebar, text="运行分割", command=self.segment).pack(fill="x", pady=(0, 6))
-        ttk.Button(sidebar, text="撤销标记", command=self.undo_last_mark).pack(fill="x", pady=(0, 6))
-        ttk.Button(sidebar, text="重置标记", command=self.reset_marks).pack(fill="x", pady=(0, 12))
+        logo = tk.Canvas(header, width=46, height=46, bg="#ffffff", highlightthickness=0)
+        logo.grid(row=0, column=0, rowspan=2, sticky="w", padx=(0, 12))
+        logo.create_oval(3, 3, 43, 43, fill="#edf2ff", outline="#dbe5ff")
+        logo.create_text(23, 22, text="CV", fill="#5b7cfa", font=(UI_FONT_FAMILY, 11, "bold"))
 
-        ttk.Label(sidebar, text="工具箱").pack(anchor="w")
-        for tool in TOOLS:
-            ttk.Radiobutton(
-                sidebar,
-                text=TOOL_LABELS[tool],
-                value=tool,
-                variable=self.tool_var,
-                command=self._cancel_polygon,
-            ).pack(anchor="w")
+        title_block = tk.Frame(header, bg="#ffffff")
+        title_block.grid(row=0, column=1, rowspan=2, sticky="w")
+        tk.Label(
+            title_block,
+            text="交互式图像分割",
+            bg="#ffffff",
+            fg="#263238",
+            font=(UI_FONT_FAMILY, 18, "bold"),
+        ).grid(row=0, column=0, sticky="w")
+        tk.Label(
+            title_block,
+            text="Interactive Image Segmentation",
+            bg="#ffffff",
+            fg="#7a8493",
+            font=(UI_FONT_FAMILY, 9),
+        ).grid(row=1, column=0, sticky="w", pady=(2, 0))
 
-        ttk.Separator(sidebar).pack(fill="x", pady=10)
-        ttk.Label(sidebar, text="标记类型").pack(anchor="w")
-        ttk.OptionMenu(sidebar, self.mark_mode_var, self.mark_mode_var.get(), *MARK_MODES.keys()).pack(fill="x")
+        header_actions = tk.Frame(header, bg="#ffffff")
+        header_actions.grid(row=0, column=2, rowspan=2, sticky="e", padx=(12, 10))
+        self._action_button(header_actions, "打开图片", self.open_image, "primary").grid(row=0, column=0, padx=4)
+        self._action_button(header_actions, "保存结果", self.save_results, "primary").grid(row=0, column=1, padx=4)
 
-        ttk.Label(sidebar, text="左侧结果视图").pack(anchor="w", pady=(10, 0))
-        ttk.OptionMenu(sidebar, self.view_var, self.view_var.get(), *VIEW_MODES, command=lambda _: self.redraw()).pack(
-            fill="x"
+        header_badges = tk.Frame(header, bg="#ffffff")
+        header_badges.grid(row=0, column=3, rowspan=2, sticky="e")
+        self._badge(header_badges, self.time_badge_var, "#f1fffb", "#178f72").grid(row=0, column=0, padx=(0, 6))
+        self._badge(header_badges, self.interaction_badge_var, "#f1fffb", "#178f72").grid(row=0, column=1)
+
+        header_edit_actions = tk.Frame(header, bg="#ffffff")
+        header_edit_actions.grid(row=0, column=4, rowspan=2, sticky="e", padx=(10, 0))
+        self._action_button(header_edit_actions, "撤销", self.undo_last_mark, "secondary").grid(row=0, column=0, padx=4)
+        self._action_button(header_edit_actions, "重置", self.reset_marks, "secondary").grid(row=0, column=1, padx=4)
+
+        # 左侧工具区保持固定气泡卡片，尽量让所有常用功能在一个页面中展示。
+        sidebar_shell = self._bubble_panel(self.root, padding=10)
+        sidebar_shell.grid(row=1, column=0, sticky="ns", padx=(16, 8), pady=(8, 16))
+        sidebar_shell.columnconfigure(0, weight=1)
+        sidebar_shell.rowconfigure(0, weight=1)
+        sidebar = tk.Frame(sidebar_shell, width=270, bg="#ffffff")
+        sidebar.grid(row=0, column=0, sticky="new")
+        sidebar.columnconfigure(0, weight=1)
+
+        self._section_title(sidebar, "辅助功能", 0)
+        action_grid = tk.Frame(sidebar, bg="#ffffff")
+        action_grid.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        action_grid.columnconfigure(0, weight=1)
+        action_grid.columnconfigure(1, weight=1)
+        self._action_button(action_grid, "BiRefNet", self.model_matting_segment, "accent").grid(
+            row=0, column=0, sticky="ew", padx=(0, 4), pady=3
+        )
+        self._action_button(action_grid, "胡须增强", self.enhance_whisker_details, "accent").grid(
+            row=0, column=1, sticky="ew", padx=(4, 0), pady=3
+        )
+        self._action_button(action_grid, "边缘分割", self.edge_segment, "accent").grid(
+            row=1, column=0, sticky="ew", padx=(0, 4), pady=(4, 0)
+        )
+        self._action_button(action_grid, "运行分割", self.segment, "primary").grid(
+            row=1, column=1, sticky="ew", padx=(4, 0), pady=(4, 0)
         )
 
-        ttk.Label(sidebar, text="主图缩放").pack(anchor="w", pady=(10, 0))
-        zoom_frame = ttk.Frame(sidebar)
-        zoom_frame.pack(fill="x")
-        ttk.Button(zoom_frame, text="-", width=4, command=self.zoom_out_main).pack(side="left")
-        ttk.Button(zoom_frame, text="+", width=4, command=self.zoom_in_main).pack(side="left", padx=(4, 0))
-        ttk.Button(zoom_frame, text="适应", width=6, command=self.reset_main_zoom).pack(side="left", padx=(4, 0))
-        ttk.Label(sidebar, textvariable=self.zoom_label_var).pack(anchor="w", pady=(3, 0))
-
-        ttk.Label(sidebar, text="笔刷/线宽").pack(anchor="w", pady=(10, 0))
-        ttk.Scale(sidebar, from_=3, to=60, variable=self.brush_size_var, orient="horizontal").pack(fill="x")
-
-        ttk.Label(sidebar, text="GrabCut迭代次数").pack(anchor="w", pady=(10, 0))
-        ttk.Spinbox(sidebar, from_=1, to=8, textvariable=self.iterations_var, width=8).pack(anchor="w")
-        ttk.Checkbutton(sidebar, text="涂抹自动扩展", variable=self.auto_expand_strokes_var).pack(anchor="w", pady=(4, 0))
-
-        ttk.Label(sidebar, text="分割后优化").pack(anchor="w", pady=(10, 0))
-        ttk.Checkbutton(sidebar, text="开运算去噪", variable=self.use_opening_var).pack(anchor="w")
-        ttk.Checkbutton(sidebar, text="闭运算填洞", variable=self.use_closing_var).pack(anchor="w")
-        ttk.Checkbutton(sidebar, text="保留最大区域", variable=self.keep_largest_var).pack(anchor="w")
-        ttk.Checkbutton(sidebar, text="轮廓平滑", variable=self.smooth_edges_var).pack(anchor="w")
-        ttk.Label(sidebar, text="优化强度").pack(anchor="w", pady=(6, 0))
-        ttk.Spinbox(sidebar, from_=3, to=15, increment=2, textvariable=self.post_kernel_var, width=8).pack(anchor="w")
-
-        ttk.Separator(sidebar).pack(fill="x", pady=10)
-        help_text = (
-            "提示:\n"
-            "1. 初始区域常配合长方形使用\n"
-            "2. 前景用绿色，背景用红色\n"
-            "3. 任意多边形双击或右键闭合\n"
-            "4. 滚轮缩放，Shift+拖动平移"
+        self._section_title(sidebar, "标记与参数", 4)
+        view_panel = tk.Frame(sidebar, bg="#ffffff")
+        view_panel.grid(row=5, column=0, sticky="ew", pady=(0, 8))
+        view_panel.columnconfigure(0, weight=1)
+        view_panel.columnconfigure(1, weight=1)
+        tk.Label(view_panel, text="标记类型", bg="#ffffff", fg="#263238").grid(row=0, column=0, sticky="w")
+        ttk.OptionMenu(view_panel, self.mark_mode_var, self.mark_mode_var.get(), *MARK_MODES.keys()).grid(
+            row=0, column=1, sticky="ew", padx=(8, 0), pady=1
         )
-        ttk.Label(sidebar, text=help_text, justify="left").pack(anchor="w")
+
+        split_panel = tk.Frame(view_panel, bg="#ffffff")
+        split_panel.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        split_panel.columnconfigure(0, weight=1)
+        split_panel.columnconfigure(1, weight=0)
+        tk.Label(split_panel, text="画笔", bg="#ffffff", fg="#263238").grid(row=0, column=0, sticky="w")
+        ttk.Spinbox(split_panel, from_=3, to=60, textvariable=self.brush_size_var, width=6).grid(
+            row=0, column=1, sticky="e", padx=(8, 0)
+        )
+        self._section_title(sidebar, "分割后优化", 6)
+        optimize_panel = tk.Frame(sidebar, bg="#ffffff")
+        optimize_panel.grid(row=7, column=0, sticky="ew", pady=(0, 8))
+        optimize_panel.columnconfigure(0, weight=1)
+        optimize_panel.columnconfigure(1, weight=1)
+        ttk.Checkbutton(optimize_panel, text="开运算去噪", variable=self.use_opening_var).grid(row=0, column=0, sticky="w", pady=1)
+        ttk.Checkbutton(optimize_panel, text="闭运算填洞", variable=self.use_closing_var).grid(row=0, column=1, sticky="w", pady=1)
+        ttk.Checkbutton(optimize_panel, text="保留最大区域", variable=self.keep_largest_var).grid(row=1, column=0, sticky="w", pady=1)
+        ttk.Checkbutton(optimize_panel, text="轮廓平滑", variable=self.smooth_edges_var).grid(row=1, column=1, sticky="w", pady=1)
+        tk.Label(optimize_panel, text="优化强度", bg="#ffffff", fg="#263238").grid(row=2, column=0, sticky="w", pady=(5, 0))
+        ttk.Spinbox(optimize_panel, from_=3, to=15, increment=2, textvariable=self.post_kernel_var, width=8).grid(
+            row=2, column=1, sticky="e", pady=(5, 0)
+        )
+
+        self._section_title(sidebar, "选择工具", 2)
+        tool_grid = tk.Frame(sidebar, bg="#ffffff")
+        tool_grid.grid(row=3, column=0, sticky="ew", pady=(0, 8))
+        tool_grid.columnconfigure(0, weight=1)
+        tool_grid.columnconfigure(1, weight=1)
+        tool_grid.columnconfigure(2, weight=1)
+        tool_icons = {
+            "brush": "● 涂抹",
+            "eraser": "⌫ 橡皮擦",
+            "line": "╱ 直线",
+            "rectangle": "▭ 长方形",
+            "square": "□ 正方形",
+            "ellipse": "⬭ 椭圆",
+            "circle": "○ 圆",
+            "pentagon": "⬟ 五边形",
+            "hexagon": "⬢ 六边形",
+            "polygon": "◇ 任意多边形",
+        }
+        for index, tool in enumerate(TOOLS):
+            self._tool_toggle(tool_grid, tool_icons[tool], tool, self.tool_var).grid(
+                row=index // 3, column=index % 3, sticky="ew", padx=2, pady=2
+        )
+
+        zoom_bottom_panel = tk.Frame(sidebar_shell, bg="#ffffff")
+        zoom_bottom_panel.grid(row=1, column=0, sticky="ew", pady=(12, 0))
+        zoom_bottom_panel.columnconfigure(0, weight=1)
+        zoom_bottom_panel.columnconfigure(1, weight=1)
+        zoom_bottom_panel.columnconfigure(2, weight=1)
+        tk.Label(
+            zoom_bottom_panel,
+            textvariable=self.zoom_label_var,
+            bg="#ffffff",
+            fg="#7a8493",
+            font=(UI_FONT_FAMILY, 9, "bold"),
+        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 6))
+        self._action_button(zoom_bottom_panel, "-", self.zoom_out_main).grid(
+            row=1, column=0, sticky="ew", padx=(0, 3)
+        )
+        self._action_button(zoom_bottom_panel, "+", self.zoom_in_main).grid(
+            row=1, column=1, sticky="ew", padx=3
+        )
+        self._action_button(zoom_bottom_panel, "适应", self.reset_main_zoom).grid(
+            row=1, column=2, sticky="ew", padx=(3, 0)
+        )
 
         self.status_var = tk.StringVar(value="准备就绪")
-        ttk.Label(sidebar, textvariable=self.status_var, justify="left", wraplength=170).pack(anchor="w", pady=(16, 0))
 
-        canvas_frame = ttk.Frame(self.root, padding=8)
-        canvas_frame.grid(row=0, column=1, sticky="nsew")
+        canvas_frame = ttk.Frame(self.root, padding=(0, 8, 16, 16), style="Workspace.TFrame")
+        canvas_frame.grid(row=1, column=1, sticky="nsew")
         canvas_frame.columnconfigure(0, weight=3, uniform="views")
         canvas_frame.columnconfigure(1, weight=2, uniform="views")
         canvas_frame.rowconfigure(0, weight=1)
 
-        result_frame = ttk.LabelFrame(canvas_frame, text="实验结果图像")
+        result_frame = self._bubble_panel(canvas_frame, padding=14)
         result_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
         result_frame.columnconfigure(0, weight=1)
-        result_frame.rowconfigure(0, weight=1)
+        result_frame.rowconfigure(1, weight=1)
+        result_header = tk.Frame(result_frame, bg="#ffffff")
+        result_header.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        result_header.columnconfigure(0, weight=1)
+        tk.Label(
+            result_header,
+            text="实验结果图像",
+            bg="#ffffff",
+            fg="#263238",
+            font=(UI_FONT_FAMILY, 12, "bold"),
+        ).grid(row=0, column=0, sticky="w")
+        self._badge(result_header, self.canvas_state_var, "#edf2ff", "#5b7cfa").grid(row=0, column=1, sticky="e")
 
-        right_frame = ttk.Frame(canvas_frame)
+        right_frame = ttk.Frame(canvas_frame, style="Workspace.TFrame")
         right_frame.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
         right_frame.columnconfigure(0, weight=1)
         right_frame.rowconfigure(0, weight=1, uniform="right_views")
         right_frame.rowconfigure(1, weight=1, uniform="right_views")
 
-        foreground_frame = ttk.LabelFrame(right_frame, text="分割前景")
+        foreground_frame = self._bubble_panel(right_frame, padding=12)
         foreground_frame.grid(row=0, column=0, sticky="nsew", pady=(0, 6))
         foreground_frame.columnconfigure(0, weight=1)
-        foreground_frame.rowconfigure(0, weight=1)
+        foreground_frame.rowconfigure(1, weight=1)
+        tk.Label(
+            foreground_frame,
+            text="分割前景",
+            bg="#ffffff",
+            fg="#263238",
+            font=(UI_FONT_FAMILY, 11, "bold"),
+        ).grid(row=0, column=0, sticky="w", pady=(0, 8))
 
-        mask_frame = ttk.LabelFrame(right_frame, text="分割掩码")
+        mask_frame = self._bubble_panel(right_frame, padding=12)
         mask_frame.grid(row=1, column=0, sticky="nsew", pady=(6, 0))
         mask_frame.columnconfigure(0, weight=1)
-        mask_frame.rowconfigure(0, weight=1)
+        mask_frame.rowconfigure(1, weight=1)
+        tk.Label(
+            mask_frame,
+            text="分割掩码",
+            bg="#ffffff",
+            fg="#263238",
+            font=(UI_FONT_FAMILY, 11, "bold"),
+        ).grid(row=0, column=0, sticky="w", pady=(0, 8))
 
-        self.canvas = tk.Canvas(result_frame, bg="#20242a", highlightthickness=0)
-        self.canvas.grid(row=0, column=0, sticky="nsew")
+        self.canvas = tk.Canvas(result_frame, bg="#f2f5f9", highlightthickness=0)
+        self.canvas.grid(row=1, column=0, sticky="nsew")
         self.canvas.bind("<Configure>", lambda _event: self.redraw())
 
-        self.foreground_canvas = tk.Canvas(foreground_frame, bg="#20242a", highlightthickness=0)
-        self.foreground_canvas.grid(row=0, column=0, sticky="nsew")
+        self.foreground_canvas = tk.Canvas(foreground_frame, bg="#f2f5f9", highlightthickness=0)
+        self.foreground_canvas.grid(row=1, column=0, sticky="nsew")
         self.foreground_canvas.bind("<Configure>", lambda _event: self.redraw())
 
-        self.mask_canvas = tk.Canvas(mask_frame, bg="#20242a", highlightthickness=0)
-        self.mask_canvas.grid(row=0, column=0, sticky="nsew")
+        self.mask_canvas = tk.Canvas(mask_frame, bg="#f2f5f9", highlightthickness=0)
+        self.mask_canvas.grid(row=1, column=0, sticky="nsew")
         self.mask_canvas.bind("<Configure>", lambda _event: self.redraw())
 
     def _bind_canvas(self) -> None:
@@ -504,6 +953,7 @@ class InteractiveSegmentationApp:
         self.image_rgb = image
         self.grabcut_mask = np.full((height, width), GC_BGD, dtype=np.uint8)
         self.result_mask = None
+        self.alpha_mask = None
         self.manual_mask = np.full((height, width), MANUAL_NONE, dtype=np.uint8)
         self.visual_marks = np.full((height, width), 255, dtype=np.uint8)
         self.pending_visual_marks = np.full((height, width), 255, dtype=np.uint8)
@@ -521,6 +971,7 @@ class InteractiveSegmentationApp:
         self.action_grabcut_before = None
         self.action_visual_before = None
         self.action_result_before = None
+        self.action_alpha_before = None
         self.action_manual_before = None
         self.action_pending_before = None
         self.action_segmentation_count_before = 0
@@ -528,7 +979,7 @@ class InteractiveSegmentationApp:
         self.action_operation_seconds_before = 0.0
         self.mark_undo_stack.clear()
         self.polygon_points.clear()
-        self.status_var.set(f"已读取: {path.name}\n尺寸: {width} x {height}")
+        self.status_var.set("图片已准备")
         self.redraw()
 
     def reset_marks(self) -> None:
@@ -536,6 +987,7 @@ class InteractiveSegmentationApp:
             return
         height, width = self.image_rgb.shape[:2]
         self.grabcut_mask = np.full((height, width), GC_BGD, dtype=np.uint8)
+        self.alpha_mask = None
         self.manual_mask = np.full((height, width), MANUAL_NONE, dtype=np.uint8)
         self.visual_marks = np.full((height, width), 255, dtype=np.uint8)
         self.pending_visual_marks = np.full((height, width), 255, dtype=np.uint8)
@@ -549,6 +1001,7 @@ class InteractiveSegmentationApp:
         self.action_grabcut_before = None
         self.action_visual_before = None
         self.action_result_before = None
+        self.action_alpha_before = None
         self.action_manual_before = None
         self.action_pending_before = None
         self.action_segmentation_count_before = 0
@@ -573,6 +1026,7 @@ class InteractiveSegmentationApp:
             self._apply_manual_mask_to_grabcut_mask()
             self.result_mask = binary_from_grabcut_mask(self.grabcut_mask)
             self.result_mask = self._postprocess_result_mask(self.result_mask)
+            self.alpha_mask = self.result_mask.copy()
         except Exception as exc:
             messagebox.showerror("分割失败", str(exc))
             return
@@ -586,6 +1040,222 @@ class InteractiveSegmentationApp:
         elapsed = self.operation_seconds
         extra = "\n已自动扩展初始涂抹区域" if expanded_initial else ""
         self.status_var.set(f"分割完成\n操作时间: {elapsed:.1f}s\n交互次数: {self.segmentation_count}{extra}")
+        self.redraw()
+
+    def edge_segment(self) -> None:
+        if self.image_rgb is None or self.grabcut_mask is None:
+            messagebox.showinfo("提示", "请先读取图像")
+            return
+
+        started_at = time.monotonic()
+        try:
+            edge_mask, canny_edges, seed_count = edge_watershed_segment(
+                self.image_rgb,
+                self.grabcut_mask,
+                self.result_mask,
+                self.manual_mask,
+            )
+
+            new_grabcut_mask = np.full(edge_mask.shape, GC_PR_BGD, dtype=np.uint8)
+            new_grabcut_mask[edge_mask > 0] = GC_PR_FGD
+            if self.manual_mask is not None:
+                new_grabcut_mask[self.manual_mask == GC_FGD] = GC_FGD
+                new_grabcut_mask[self.manual_mask == GC_PR_FGD] = GC_PR_FGD
+                new_grabcut_mask[self.manual_mask == GC_BGD] = GC_BGD
+                new_grabcut_mask[self.manual_mask == GC_PR_BGD] = GC_PR_BGD
+
+            self.grabcut_mask = new_grabcut_mask
+            self.result_mask = self._postprocess_result_mask(edge_mask)
+            self.alpha_mask = self.result_mask.copy()
+        except Exception as exc:
+            messagebox.showerror("边缘分割失败", str(exc))
+            return
+
+        self.segmentation_count += 1
+        self.pending_edits = False
+        if self.pending_visual_marks is not None:
+            self.pending_visual_marks.fill(255)
+        self.mark_undo_stack.clear()
+        self._record_operation_seconds(started_at)
+        self.status_var.set(
+            "边缘分割完成\n"
+            f"Canny 边缘像素: {int(np.count_nonzero(canny_edges))}\n"
+            f"前景种子区域: {seed_count}\n"
+            f"操作时间: {self.operation_seconds:.1f}s\n"
+            f"交互次数: {self.segmentation_count}"
+        )
+        self.redraw()
+
+    def model_matting_segment(self) -> None:
+        self._start_model_matting("birefnet-general", "BiRefNet")
+
+    def _start_model_matting(self, model_name: str, display_name: str) -> None:
+        if self.image_rgb is None or self.grabcut_mask is None:
+            messagebox.showinfo("提示", "请先读取图像")
+            return
+        if self.model_running:
+            messagebox.showinfo("提示", "模型正在处理中，请等待当前任务完成")
+            return
+
+        image_rgb = self.image_rgb.copy()
+        started_at = time.monotonic()
+        self.model_running = True
+        self.status_var.set(f"{display_name} 正在处理...\nCPU 运行可能需要较久")
+        self.redraw()
+
+        # 模型推理较慢，放到后台线程，避免 Tkinter 主界面被系统判定为未响应。
+        worker = threading.Thread(
+            target=self._run_model_matting_worker,
+            args=(image_rgb, started_at, model_name, display_name),
+            daemon=True,
+        )
+        worker.start()
+
+    def _run_model_matting_worker(
+        self,
+        image_rgb: np.ndarray,
+        started_at: float,
+        model_name: str,
+        display_name: str,
+    ) -> None:
+        try:
+            from rembg import new_session, remove
+        except ImportError:
+            self.root.after(
+                0,
+                self._finish_model_matting_error,
+                display_name,
+                "缺少依赖",
+                '请先在 conda 环境中安装: python -m pip install "rembg[cpu]"',
+            )
+            return
+
+        try:
+            with self.model_lock:
+                session = self.model_sessions.get(model_name)
+                if session is None:
+                    session = new_session(model_name)
+                    self.model_sessions[model_name] = session
+            input_image = Image.fromarray(image_rgb, mode="RGB")
+            try:
+                output_image = remove(input_image, session=session, putalpha=True).convert("RGBA")
+            except TypeError:
+                output_image = remove(input_image, session=session).convert("RGBA")
+            alpha = np.array(output_image, dtype=np.uint8)[:, :, 3]
+        except Exception as exc:
+            self.root.after(0, self._finish_model_matting_error, display_name, f"{display_name} 失败", str(exc))
+            return
+
+        self.root.after(0, self._finish_model_matting_success, alpha, started_at, display_name)
+
+    def _finish_model_matting_error(self, display_name: str, title: str, message: str) -> None:
+        self.model_running = False
+        self.status_var.set(f"{display_name} 处理失败")
+        self.redraw()
+        messagebox.showerror(title, message)
+
+    def _finish_model_matting_success(self, alpha: np.ndarray, started_at: float, display_name: str) -> None:
+        if self.image_rgb is None or self.grabcut_mask is None:
+            self.model_running = False
+            self.redraw()
+            return
+        if alpha.shape != self.grabcut_mask.shape:
+            self.model_running = False
+            self.status_var.set(f"{display_name} 结果尺寸与当前图像不一致")
+            self.redraw()
+            messagebox.showerror(f"{display_name} 失败", "模型结果尺寸与当前图像不一致，请重新读取图像后再试")
+            return
+
+        foreground = alpha >= 64
+        strong_foreground = alpha >= 230
+        sure_background = alpha <= 12
+
+        self.alpha_mask = alpha
+        self.result_mask = np.where(foreground, 255, 0).astype(np.uint8)
+        self.grabcut_mask = np.full(alpha.shape, GC_PR_BGD, dtype=np.uint8)
+        self.grabcut_mask[foreground] = GC_PR_FGD
+        self.grabcut_mask[strong_foreground] = GC_FGD
+        self.grabcut_mask[sure_background] = GC_BGD
+
+        if self.manual_mask is not None:
+            self.manual_mask.fill(MANUAL_NONE)
+        if self.visual_marks is not None:
+            self.visual_marks.fill(255)
+        if self.pending_visual_marks is not None:
+            self.pending_visual_marks.fill(255)
+
+        self.pending_edits = False
+        self.segmentation_count += 1
+        self.mark_undo_stack.clear()
+        self.model_running = False
+        self._record_operation_seconds(started_at)
+        self.status_var.set(
+            f"{display_name} 完成\n"
+            f"操作时间: {self.operation_seconds:.1f}s\n"
+            f"交互次数: {self.segmentation_count}"
+        )
+        self.redraw()
+
+    def enhance_whisker_details(self) -> None:
+        if self.image_rgb is None or self.grabcut_mask is None:
+            messagebox.showinfo("提示", "请先读取图像")
+            return
+        if self.result_mask is None:
+            messagebox.showinfo("提示", "请先运行一次分割或模型抠图")
+            return
+        if self.manual_mask is None:
+            messagebox.showinfo("提示", "请先用前景笔刷在胡须附近画几笔")
+            return
+
+        seed_mask = (self.manual_mask == GC_FGD) | (self.manual_mask == GC_PR_FGD)
+        if not np.any(seed_mask):
+            messagebox.showinfo("提示", "请先用前景笔刷在胡须附近画几笔")
+            return
+
+        blocked_mask = (self.manual_mask == GC_BGD) | (self.manual_mask == GC_PR_BGD)
+        started_at = time.monotonic()
+        self._snapshot_action_masks()
+        try:
+            enhanced_mask, enhanced_alpha, detail_mask, added_pixels = enhance_bright_line_details(
+                self.image_rgb,
+                self.result_mask,
+                seed_mask,
+                self.alpha_mask,
+                blocked_mask=blocked_mask,
+            )
+        except Exception as exc:
+            self._clear_action_snapshot()
+            messagebox.showerror("胡须增强失败", str(exc))
+            return
+
+        if added_pixels <= 0:
+            self._clear_action_snapshot()
+            self.status_var.set("胡须增强未找到可加入的细线\n请把前景笔刷画在胡须附近")
+            return
+
+        detail_area = detail_mask > 0
+        self.result_mask = enhanced_mask
+        self.alpha_mask = enhanced_alpha
+        self.grabcut_mask[detail_area] = GC_FGD
+        self.manual_mask[detail_area] = GC_FGD
+        if self.visual_marks is not None:
+            self.visual_marks[detail_area] = GC_FGD
+        if self.pending_visual_marks is not None:
+            self.pending_visual_marks.fill(255)
+
+        self.pending_edits = False
+        self.segmentation_count += 1
+        self.mark_count += 1
+        if self._action_masks_changed():
+            self._push_mark_undo_from_action_snapshot()
+        self._record_operation_seconds(started_at)
+        self._clear_action_snapshot()
+        self.status_var.set(
+            f"胡须增强完成\n"
+            f"新增细节像素: {added_pixels}\n"
+            f"操作时间: {self.operation_seconds:.1f}s\n"
+            f"交互次数: {self.segmentation_count}"
+        )
         self.redraw()
 
     def save_results(self) -> None:
@@ -602,18 +1272,24 @@ class InteractiveSegmentationApp:
             return
 
         stem = self.image_path.stem
+        date_suffix = datetime.now().strftime("%Y%m%d_%H%M%S")
         out_dir = Path(target_dir)
-        overlay_path = out_dir / f"{stem}_overlay.png"
-        mask_path = out_dir / f"{stem}_mask.png"
-        foreground_path = out_dir / f"{stem}_foreground.png"
+        overlay_path = out_dir / f"{stem}_overlay_{date_suffix}.png"
+        mask_path = out_dir / f"{stem}_mask_{date_suffix}.png"
+        foreground_path = out_dir / f"{stem}_foreground_{date_suffix}.png"
+        alpha_path = out_dir / f"{stem}_alpha_{date_suffix}.png"
 
         overlay = self.build_view_image("叠加结果", annotate=True)
         foreground = self.build_foreground_image(annotate=False)
         Image.fromarray(self.current_binary_mask(), mode="L").save(mask_path)
         write_rgb_image(overlay_path, overlay)
         write_rgb_image(foreground_path, foreground)
+        saved_files = [overlay_path, mask_path, foreground_path]
+        if self.alpha_mask is not None:
+            Image.fromarray(self.alpha_mask, mode="L").save(alpha_path)
+            saved_files.append(alpha_path)
 
-        self.last_saved_files = [overlay_path, mask_path, foreground_path]
+        self.last_saved_files = saved_files
         self.status_var.set("保存完成:\n" + "\n".join(path.name for path in self.last_saved_files))
         messagebox.showinfo("保存完成", "\n".join(str(path) for path in self.last_saved_files))
 
@@ -804,6 +1480,7 @@ class InteractiveSegmentationApp:
         self.action_grabcut_before = None if self.grabcut_mask is None else self.grabcut_mask.copy()
         self.action_visual_before = None if self.visual_marks is None else self.visual_marks.copy()
         self.action_result_before = None if self.result_mask is None else self.result_mask.copy()
+        self.action_alpha_before = None if self.alpha_mask is None else self.alpha_mask.copy()
         self.action_manual_before = None if self.manual_mask is None else self.manual_mask.copy()
         self.action_pending_before = None if self.pending_visual_marks is None else self.pending_visual_marks.copy()
         self.action_pending_edits_before = getattr(self, "pending_edits", False)
@@ -819,6 +1496,8 @@ class InteractiveSegmentationApp:
             changed = changed or not np.array_equal(self.action_visual_before, self.visual_marks)
         if self.action_result_before is not None and self.result_mask is not None:
             changed = changed or not np.array_equal(self.action_result_before, self.result_mask)
+        if self.action_alpha_before is not None and self.alpha_mask is not None:
+            changed = changed or not np.array_equal(self.action_alpha_before, self.alpha_mask)
         if self.action_manual_before is not None and self.manual_mask is not None:
             changed = changed or not np.array_equal(self.action_manual_before, self.manual_mask)
         if self.action_pending_before is not None and self.pending_visual_marks is not None:
@@ -829,6 +1508,7 @@ class InteractiveSegmentationApp:
         self.action_grabcut_before = None
         self.action_visual_before = None
         self.action_result_before = None
+        self.action_alpha_before = None
         self.action_manual_before = None
         self.action_pending_before = None
         self.action_pending_edits_before = False
@@ -841,6 +1521,7 @@ class InteractiveSegmentationApp:
             MarkUndoState(
                 grabcut_mask=None if self.action_grabcut_before is None else self.action_grabcut_before.copy(),
                 result_mask=None if self.action_result_before is None else self.action_result_before.copy(),
+                alpha_mask=None if self.action_alpha_before is None else self.action_alpha_before.copy(),
                 manual_mask=None if self.action_manual_before is None else self.action_manual_before.copy(),
                 visual_marks=None if self.action_visual_before is None else self.action_visual_before.copy(),
                 pending_visual_marks=None
@@ -863,6 +1544,7 @@ class InteractiveSegmentationApp:
         state = self.mark_undo_stack.pop()
         self.grabcut_mask = None if state.grabcut_mask is None else state.grabcut_mask.copy()
         self.result_mask = None if state.result_mask is None else state.result_mask.copy()
+        self.alpha_mask = None if state.alpha_mask is None else state.alpha_mask.copy()
         self.manual_mask = None if state.manual_mask is None else state.manual_mask.copy()
         self.visual_marks = None if state.visual_marks is None else state.visual_marks.copy()
         self.pending_visual_marks = (
@@ -908,6 +1590,8 @@ class InteractiveSegmentationApp:
                 cv2.line(self.manual_mask, p1, p2, GC_BGD, thickness)
             if self.result_mask is not None:
                 cv2.line(self.result_mask, p1, p2, 0, thickness)
+            if self.alpha_mask is not None:
+                cv2.line(self.alpha_mask, p1, p2, 0, thickness)
             cv2.line(self.visual_marks, p1, p2, 255, thickness)
             if self.pending_visual_marks is not None:
                 cv2.line(self.pending_visual_marks, p1, p2, 255, thickness)
@@ -1088,6 +1772,13 @@ class InteractiveSegmentationApp:
         height, width = self.image_rgb.shape[:2]
         return np.zeros((height, width), dtype=np.uint8)
 
+    def current_alpha_mask(self) -> np.ndarray:
+        if self.image_rgb is None:
+            return np.zeros((480, 640), dtype=np.uint8)
+        if self.alpha_mask is not None:
+            return self.alpha_mask
+        return self.current_binary_mask()
+
     def build_view_image(self, view: str, annotate: bool = True) -> np.ndarray:
         if self.image_rgb is None:
             return np.zeros((480, 640, 3), dtype=np.uint8)
@@ -1106,7 +1797,7 @@ class InteractiveSegmentationApp:
         return output
 
     def build_mask_image(self, annotate: bool = True) -> np.ndarray:
-        mask = self.current_binary_mask()
+        mask = self.current_alpha_mask()
         output = np.repeat(mask[:, :, None], 3, axis=2)
         if annotate:
             output = self._annotate(output)
@@ -1115,8 +1806,8 @@ class InteractiveSegmentationApp:
     def build_foreground_image(self, annotate: bool = True) -> np.ndarray:
         if self.image_rgb is None:
             return np.zeros((480, 640, 3), dtype=np.uint8)
-        mask = self.current_binary_mask()
-        output = (self.image_rgb * (mask[:, :, None] > 0)).astype(np.uint8)
+        alpha = self.current_alpha_mask().astype(np.float32) / 255.0
+        output = (self.image_rgb.astype(np.float32) * alpha[:, :, None]).astype(np.uint8)
         if annotate:
             output = self._annotate(output)
         return output
@@ -1156,8 +1847,8 @@ class InteractiveSegmentationApp:
         image = Image.fromarray(image_rgb, mode="RGB")
         draw = ImageDraw.Draw(image)
         elapsed = self.operation_seconds
-        text = f"Time: {elapsed:.1f}s   Interactions: {self.segmentation_count}   Marks: {self.mark_count}"
-        font = ImageFont.load_default()
+        text = f"Time: {elapsed:.1f}s   Interactions: {self.segmentation_count}"
+        font = load_annotation_font(16)
         bbox = draw.textbbox((0, 0), text, font=font)
         x, y = 12, 12
         draw.rectangle((x - 6, y - 5, x + bbox[2] + 6, y + bbox[3] + 6), fill=(0, 0, 0))
@@ -1165,6 +1856,7 @@ class InteractiveSegmentationApp:
         return np.array(image)
 
     def redraw(self) -> None:
+        self._refresh_header_badges()
         self._draw_result_canvas()
         self._draw_foreground_canvas()
         self._draw_mask_canvas()
@@ -1175,7 +1867,7 @@ class InteractiveSegmentationApp:
             self._draw_empty_message(self.canvas, "请读取图像")
             return
 
-        display = Image.fromarray(self.build_view_image(self.view_var.get(), annotate=True), mode="RGB")
+        display = Image.fromarray(self.build_view_image("叠加结果", annotate=True), mode="RGB")
         self.display_geometry, self.tk_image = self._paint_main_image_on_canvas(display)
         self._draw_preview()
 
@@ -1273,8 +1965,8 @@ class InteractiveSegmentationApp:
             canvas.winfo_width() // 2,
             canvas.winfo_height() // 2,
             text=text,
-            fill="#d8dee9",
-            font=("Microsoft YaHei", 18),
+            fill="#7a8493",
+            font=(UI_FONT_FAMILY, 18),
         )
 
     def _draw_preview(self) -> None:
