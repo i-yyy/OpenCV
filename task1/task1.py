@@ -60,6 +60,7 @@ TOOL_LABELS = {
 }
 
 UI_FONT_FAMILY = "Microsoft YaHei"
+TASK1_DIR = Path(__file__).resolve().parent
 ANNOTATION_FONT_CANDIDATES = (
     Path("C:/Windows/Fonts/msyh.ttc"),
     Path("C:/Windows/Fonts/msyh.ttf"),
@@ -86,6 +87,28 @@ def require_cv2():
             "缺少 OpenCV"
         ) from exc
     return cv2
+
+
+def bleed_edge_colors(rgb: np.ndarray, alpha: np.ndarray, iterations: int = 16) -> np.ndarray:
+    cv2 = require_cv2()
+    output = rgb.copy()
+    filled = np.asarray(alpha) > 0
+    if not np.any(filled) or np.all(filled):
+        return output
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    filled_u8 = filled.astype(np.uint8)
+    for _ in range(iterations):
+        expanded = cv2.dilate(filled_u8, kernel, iterations=1)
+        ring = (expanded > 0) & (filled_u8 == 0)
+        if not np.any(ring):
+            break
+        for channel_index in range(3):
+            source = output[:, :, channel_index].copy()
+            source[filled_u8 == 0] = 0
+            output[:, :, channel_index][ring] = cv2.dilate(source, kernel, iterations=1)[ring]
+        filled_u8[ring] = 1
+    return output
 
 
 def read_rgb_image(path: str | Path) -> np.ndarray:
@@ -658,6 +681,9 @@ class InteractiveSegmentationApp:
         header_actions.grid(row=0, column=2, rowspan=2, sticky="e", padx=(12, 10))
         self._action_button(header_actions, "打开图片", self.open_image, "primary").grid(row=0, column=0, padx=4)
         self._action_button(header_actions, "保存结果", self.save_results, "primary").grid(row=0, column=1, padx=4)
+        self._action_button(header_actions, "保存透明图", self.save_transparent_foreground, "accent").grid(
+            row=0, column=2, padx=4
+        )
 
         header_badges = tk.Frame(header, bg="#ffffff")
         header_badges.grid(row=0, column=3, rowspan=2, sticky="e")
@@ -1293,6 +1319,28 @@ class InteractiveSegmentationApp:
         self.status_var.set("保存完成:\n" + "\n".join(path.name for path in self.last_saved_files))
         messagebox.showinfo("保存完成", "\n".join(str(path) for path in self.last_saved_files))
 
+    def save_transparent_foreground(self) -> None:
+        if self.image_rgb is None or self.image_path is None:
+            messagebox.showinfo("提示", "请先读取图像")
+            return
+        if self.result_mask is None or self.pending_edits:
+            self.segment()
+            if self.result_mask is None:
+                return
+
+        default_dir = TASK1_DIR.parent / "task3" / "foreground"
+        if not default_dir.exists():
+            default_dir.mkdir(parents=True, exist_ok=True)
+        stem = self.image_path.stem
+        date_suffix = datetime.now().strftime("%Y%m%d_%H%M%S")
+        saved_path = default_dir / f"{stem}_transparent_{date_suffix}.png"
+
+        transparent = self.build_transparent_foreground_image()
+        Image.fromarray(transparent, mode="RGBA").save(saved_path)
+        self.last_saved_files = [saved_path]
+        self.status_var.set(f"透明背景图已保存:\n{saved_path}")
+        messagebox.showinfo("保存完成", str(saved_path))
+
     def on_press(self, event: tk.Event) -> None:
         if self._shift_pressed(event):
             return
@@ -1811,6 +1859,13 @@ class InteractiveSegmentationApp:
         if annotate:
             output = self._annotate(output)
         return output
+
+    def build_transparent_foreground_image(self) -> np.ndarray:
+        if self.image_rgb is None:
+            return np.zeros((480, 640, 4), dtype=np.uint8)
+        alpha = self.current_alpha_mask().astype(np.uint8)
+        rgb = bleed_edge_colors(self.image_rgb, alpha)
+        return np.dstack((rgb, alpha)).astype(np.uint8)
 
     def _overlay_result(self, base: np.ndarray) -> np.ndarray:
         cv2 = require_cv2()
