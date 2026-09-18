@@ -24,10 +24,13 @@ PAPER = "#fffaf0"
 PANEL = "#fff6df"
 MINT = "#bdebd8"
 PINK = "#f6b7c8"
-ROSE = "#df6f91"
 INK = "#50433b"
 BROWN = "#9b735f"
 DEFAULT_TEXT_LIFT = 6
+TEXT_LENGTH = 10
+DEFAULT_TEXT = "东南大学彩虹文字实验"
+BACKGROUND_STROKE_WIDTH = 3
+BACKGROUND_SAMPLE_LIFT_RATIO = 0.9
 
 
 @dataclass(frozen=True)
@@ -50,13 +53,7 @@ FONT_CANDIDATES = (
 )
 
 
-TEXT_STYLES = {
-    "云朵白字": {"fill": "#fffdf7", "stroke": "#70a7e8", "shadow": "#f4abc1", "stroke_width": 3},
-    "粉蓝贴纸": {"fill": "#ffffff", "stroke": "#f28db0", "shadow": "#8ed6e4", "stroke_width": 4},
-    "薄荷手账": {"fill": "#35685c", "stroke": "#f6f2d7", "shadow": "#9cdcc8", "stroke_width": 3},
-    "暖黄艺术": {"fill": "#fff0a8", "stroke": "#9b5f8e", "shadow": "#f3a3b8", "stroke_width": 3},
-    "智能协调": {"fill": None, "stroke": None, "shadow": "#f1a9bc", "stroke_width": 3},
-}
+ColorValue = str | tuple[int, int, int] | tuple[int, int, int, int]
 
 
 def available_fonts() -> list[FontChoice]:
@@ -230,8 +227,35 @@ def point_at_length(
     return x, y, angle
 
 
-def text_bbox(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, stroke_width: int = 0) -> tuple[int, int, int, int]:
+def text_bbox(
+    draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, stroke_width: int = 0
+) -> tuple[int, int, int, int]:
     return draw.textbbox((0, 0), text, font=font, stroke_width=stroke_width)
+
+
+def is_chinese_character(char: str) -> bool:
+    return "\u4e00" <= char <= "\u9fff"
+
+
+def contrast_outline(color: tuple[int, int, int]) -> tuple[int, int, int, int]:
+    return (0, 0, 0, 255)
+
+
+def sample_background_color(image: Image.Image, x: float, y: float, radius: int = 8) -> tuple[int, int, int]:
+    arr = np.asarray(image.convert("RGB"))
+    height, width = arr.shape[:2]
+    cx = max(0, min(width - 1, int(round(x))))
+    cy = max(0, min(height - 1, int(round(y))))
+    x1 = max(0, cx - radius)
+    x2 = min(width, cx + radius + 1)
+    y1 = max(0, cy - radius)
+    y2 = min(height, cy + radius + 1)
+    patch = arr[y1:y2, x1:x2]
+    if patch.size == 0:
+        pixel = arr[cy, cx]
+    else:
+        pixel = np.median(patch.reshape(-1, 3), axis=0)
+    return tuple(int(channel) for channel in pixel)
 
 
 class StickerCurveTextApp:
@@ -252,14 +276,14 @@ class StickerCurveTextApp:
         self.active_curve: list[tuple[float, float]] = []
         self.active_lengths: list[float] = []
 
-        self.text_var = tk.StringVar(value="东南大学")
+        self.selected_position_ratio: float | None = None
+
+        self.text_var = tk.StringVar(value=DEFAULT_TEXT)
         self.font_var = tk.StringVar(value=self.fonts[min(5, len(self.fonts) - 1)].name)
         self.size_var = tk.IntVar(value=38)
-        self.spacing_var = tk.IntVar(value=6)
         self.position_var = tk.IntVar(value=50)
-        self.offset_var = tk.IntVar(value=0)
-        self.style_var = tk.StringVar(value="粉蓝贴纸")
         self.show_curve_var = tk.BooleanVar(value=False)
+        self.position_status_var = tk.StringVar(value="插入位置：50%")
         self.status_var = tk.StringVar(value="打开图片后开始计时")
         self.time_var = tk.StringVar(value="操作时间 0.0s")
 
@@ -353,14 +377,23 @@ class StickerCurveTextApp:
         )
         header.pack(fill=tk.X, padx=14, pady=(14, 10))
 
-        self.add_entry("文字输入（4-10字）", self.text_var)
+        self.add_entry("文字输入（10个中文汉字）", self.text_var)
         self.text_var.trace_add("write", lambda *_args: self.refresh_preview())
         self.add_combo("字体选择", self.font_var, [font.name for font in self.fonts])
         self.add_scale("字号", self.size_var, 20, 72)
-        self.add_scale("字间距", self.spacing_var, 0, 24)
-        self.add_scale("外边缘插入位置", self.position_var, 5, 95)
-        self.add_scale("贴边微调", self.offset_var, -30, 30)
-        self.add_combo("颜色风格", self.style_var, list(TEXT_STYLES.keys()))
+        self.add_scale("外边缘插入位置", self.position_var, 5, 95, self.update_position_from_slider)
+
+        position_label = tk.Label(
+            self.panel,
+            textvariable=self.position_status_var,
+            bg=PAPER,
+            fg=INK,
+            anchor="w",
+            font=("Microsoft YaHei", 10, "bold"),
+            padx=10,
+            pady=7,
+        )
+        position_label.pack(fill=tk.X, padx=18, pady=(10, 4))
 
         curve_check = tk.Checkbutton(
             self.panel,
@@ -377,7 +410,7 @@ class StickerCurveTextApp:
 
         hint = tk.Label(
             self.panel,
-            text="提示：点击彩虹外边缘，可快速改变文字位置。",
+            text="提示：可以拖动滑轨或点击彩虹外边缘改变文字位置；调节字号后无需重新选择位置。",
             bg=PANEL,
             fg="#8a786a",
             wraplength=220,
@@ -405,7 +438,7 @@ class StickerCurveTextApp:
         combo.pack(fill=tk.X, padx=18, ipady=3)
         combo.bind("<<ComboboxSelected>>", lambda _event: self.refresh_preview())
 
-    def add_scale(self, title: str, variable: tk.IntVar, from_: int, to: int) -> None:
+    def add_scale(self, title: str, variable: tk.IntVar, from_: int, to: int, command=None) -> None:
         row = tk.Frame(self.panel, bg=PANEL)
         row.pack(fill=tk.X, padx=18, pady=(9, 0))
         self.label(row, title).pack(side=tk.LEFT)
@@ -417,7 +450,7 @@ class StickerCurveTextApp:
             to=to,
             orient=tk.HORIZONTAL,
             variable=variable,
-            command=lambda _value: self.refresh_preview(),
+            command=command or (lambda _value: self.refresh_preview()),
             bg=PANEL,
             fg=INK,
             troughcolor="#f0dfc7",
@@ -427,13 +460,23 @@ class StickerCurveTextApp:
         )
         scale.pack(fill=tk.X, padx=16)
 
+    def update_position_from_slider(self, value: str) -> None:
+        percent = int(float(value))
+        self.selected_position_ratio = percent / 100
+        self.position_status_var.set(f"插入位置：{percent}%")
+        self.refresh_preview()
+
     def build_statusbar(self) -> None:
         statusbar = tk.Frame(self.root, bg="#efe0ce", height=34)
         statusbar.pack(fill=tk.X, padx=14, pady=(0, 12))
         statusbar.pack_propagate(False)
-        tk.Label(statusbar, textvariable=self.status_var, bg="#efe0ce", fg="#7d6c62", font=("Microsoft YaHei", 10)).pack(
-            side=tk.LEFT, padx=12
-        )
+        tk.Label(
+            statusbar,
+            textvariable=self.status_var,
+            bg="#efe0ce",
+            fg="#7d6c62",
+            font=("Microsoft YaHei", 10),
+        ).pack(side=tk.LEFT, padx=12)
 
     def selected_font(self) -> FontChoice:
         for font in self.fonts:
@@ -457,22 +500,21 @@ class StickerCurveTextApp:
             return
         self.original_image = image
         self.load_time = time.perf_counter()
+        self.selected_position_ratio = self.position_var.get() / 100
+        self.position_status_var.set(f"插入位置：{self.position_var.get()}%")
         self.status_var.set(f"已读取图片：{path.name}")
         self.refresh_preview()
 
     def validate_text(self) -> str | None:
         text = self.text_var.get().strip()
-        if not 4 <= len(text) <= 10:
-            self.status_var.set("文字需要控制在 4-10 个字之间")
+        if len(text) != TEXT_LENGTH or not all(is_chinese_character(char) for char in text):
+            self.status_var.set(f"文字必须是 {TEXT_LENGTH} 个中文汉字")
             return None
         return text
 
     def render_result(self) -> Image.Image | None:
         if self.original_image is None:
             return None
-        text = self.validate_text()
-        if text is None:
-            return self.original_image.copy()
 
         image = self.original_image.convert("RGBA")
         curve = extract_outer_curve(self.original_image)
@@ -480,23 +522,22 @@ class StickerCurveTextApp:
         self.active_curve = curve
         self.active_lengths = lengths
 
+        text = self.validate_text()
+        if text is None:
+            return image.convert("RGB")
+        if self.selected_position_ratio is None:
+            self.selected_position_ratio = self.position_var.get() / 100
+
         font = ImageFont.truetype(str(self.selected_font().path), self.size_var.get())
-        style = TEXT_STYLES[self.style_var.get()]
-        fill = style["fill"]
-        stroke = style["stroke"]
-        if fill is None or stroke is None:
-            fill, stroke = self.smart_colors(image, curve, lengths)
-        shadow = style["shadow"]
-        stroke_width = int(style["stroke_width"])
 
         probe = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
         char_widths = []
         for char in text:
-            bbox = text_bbox(probe, char, font, stroke_width)
+            bbox = text_bbox(probe, char, font, BACKGROUND_STROKE_WIDTH)
             char_widths.append(max(1, bbox[2] - bbox[0]))
-        spacing = self.spacing_var.get()
+        spacing = max(1, int(self.size_var.get() * 0.16))
         total_width = sum(char_widths) + spacing * (len(text) - 1)
-        center_length = lengths[-1] * self.position_var.get() / 100
+        center_length = lengths[-1] * self.selected_position_ratio
         start = center_length - total_width / 2
 
         cursor = start
@@ -505,36 +546,32 @@ class StickerCurveTextApp:
             if 0 <= char_center <= lengths[-1]:
                 x, y, angle = point_at_length(curve, lengths, char_center)
                 normal_angle = angle - math.pi / 2
-                visual_offset = self.offset_var.get() + DEFAULT_TEXT_LIFT
-                x += math.cos(normal_angle) * visual_offset
-                y += math.sin(normal_angle) * visual_offset
+                x += math.cos(normal_angle) * DEFAULT_TEXT_LIFT
+                y += math.sin(normal_angle) * DEFAULT_TEXT_LIFT
                 rotate_angle = -math.degrees(angle)
-                self.paste_rotated_char(image, char, font, x, y, rotate_angle, fill, stroke, shadow, stroke_width)
+                sample_lift = max(24, int(self.size_var.get() * BACKGROUND_SAMPLE_LIFT_RATIO))
+                sample_x = x + math.cos(normal_angle) * sample_lift
+                sample_y = y + math.sin(normal_angle) * sample_lift
+                fill = sample_background_color(self.original_image, sample_x, sample_y)
+                stroke = contrast_outline(fill)
+                self.paste_rotated_char(
+                    image,
+                    char,
+                    font,
+                    x,
+                    y,
+                    rotate_angle,
+                    fill,
+                    stroke,
+                    (0, 0, 0, 0),
+                    BACKGROUND_STROKE_WIDTH,
+                )
             cursor += char_widths[index] + spacing
 
         self.status_var.set(
-            f"当前字体：{self.font_var.get()} | 曲线：彩虹外边缘 | 风格：{self.style_var.get()}"
+            f"当前字体：{self.font_var.get()} | 曲线：彩虹外边缘 | 文字颜色：取自所在背景"
         )
         return image.convert("RGB")
-
-    def smart_colors(
-        self, image: Image.Image, curve: list[tuple[float, float]], lengths: list[float]
-    ) -> tuple[str, str]:
-        center_length = lengths[-1] * self.position_var.get() / 100
-        x, y, _angle = point_at_length(curve, lengths, center_length)
-        arr = np.asarray(image.convert("RGB"))
-        height, width = arr.shape[:2]
-        x1 = max(0, int(x) - 18)
-        x2 = min(width, int(x) + 18)
-        y1 = max(0, int(y) - 18)
-        y2 = min(height, int(y) + 18)
-        patch = arr[y1:y2, x1:x2]
-        if patch.size == 0:
-            return "#ffffff", "#70a7e8"
-        brightness = float(np.mean(patch))
-        if brightness > 185:
-            return "#62495c", "#ffffff"
-        return "#fffdf7", "#315f9f"
 
     def paste_rotated_char(
         self,
@@ -544,9 +581,9 @@ class StickerCurveTextApp:
         x: float,
         y: float,
         angle: float,
-        fill: str,
-        stroke: str,
-        shadow: str,
+        fill: ColorValue,
+        stroke: ColorValue,
+        shadow: ColorValue,
         stroke_width: int,
     ) -> None:
         probe = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
@@ -595,11 +632,15 @@ class StickerCurveTextApp:
             for i, point in enumerate(self.active_curve[::34]):
                 x, y = point
                 draw.ellipse((x - 3, y - 3, x + 3, y + 3), fill=(189, 235, 216, 230))
-            if self.active_lengths:
-                x, y, _angle = point_at_length(
-                    self.active_curve, self.active_lengths, self.active_lengths[-1] * self.position_var.get() / 100
+            if self.active_lengths and self.selected_position_ratio is not None:
+                marker_length = self.active_lengths[-1] * self.selected_position_ratio
+                x, y, _angle = point_at_length(self.active_curve, self.active_lengths, marker_length)
+                draw.ellipse(
+                    (x - 7, y - 7, x + 7, y + 7),
+                    fill=(255, 250, 240, 255),
+                    outline=(223, 111, 145, 255),
+                    width=3,
                 )
-                draw.ellipse((x - 7, y - 7, x + 7, y + 7), fill=(255, 250, 240, 255), outline=(223, 111, 145, 255), width=3)
         image.alpha_composite(overlay)
 
     def show_on_canvas(self, image: Image.Image) -> None:
@@ -622,26 +663,32 @@ class StickerCurveTextApp:
                 self.canvas.create_oval(x, y, x + 2, y + 2, fill="#f1dfca", outline="")
 
     def choose_position_from_click(self, event: tk.Event) -> None:
-        if not self.active_curve or not self.active_lengths:
+        if self.original_image is None or not self.active_curve or not self.active_lengths:
             return
         ox, oy = self.display_offset
         if self.display_scale <= 0:
             return
         x = (event.x - ox) / self.display_scale
         y = (event.y - oy) / self.display_scale
-        best_index = min(range(len(self.active_curve)), key=lambda i: (self.active_curve[i][0] - x) ** 2 + (self.active_curve[i][1] - y) ** 2)
+        if x < 0 or y < 0 or x >= self.original_image.width or y >= self.original_image.height:
+            return
+        best_index = min(
+            range(len(self.active_curve)),
+            key=lambda i: (self.active_curve[i][0] - x) ** 2 + (self.active_curve[i][1] - y) ** 2,
+        )
         percent = int(round(self.active_lengths[best_index] / self.active_lengths[-1] * 100))
+        self.selected_position_ratio = max(0.0, min(1.0, self.active_lengths[best_index] / self.active_lengths[-1]))
         self.position_var.set(max(5, min(95, percent)))
+        self.position_status_var.set(f"插入位置：{self.position_var.get()}%")
         self.refresh_preview()
 
     def reset_controls(self) -> None:
-        self.text_var.set("彩虹快乐日")
+        self.text_var.set(DEFAULT_TEXT)
         self.font_var.set(self.fonts[min(5, len(self.fonts) - 1)].name)
         self.size_var.set(38)
-        self.spacing_var.set(6)
         self.position_var.set(50)
-        self.offset_var.set(0)
-        self.style_var.set("粉蓝贴纸")
+        self.selected_position_ratio = 0.5
+        self.position_status_var.set("插入位置：50%")
         self.show_curve_var.set(False)
         self.refresh_preview()
 

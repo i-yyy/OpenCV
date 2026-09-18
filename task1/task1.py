@@ -466,6 +466,12 @@ class InteractiveSegmentationApp:
         self.foreground_tk_image: ImageTk.PhotoImage | None = None
         self.mask_tk_image: ImageTk.PhotoImage | None = None
         self.operation_seconds = 0.0
+        self.ui_ready_at: float | None = None
+        self.model_ready_at: float | None = None
+        self.timer_reset_at = time.monotonic()
+        self.timer_start_at: float | None = None
+        self.timer_stopped_at: float | None = None
+        self.timer_update_job: str | None = None
         self.segmentation_count = 0
         self.mark_count = 0
         self.pending_edits = False
@@ -474,6 +480,7 @@ class InteractiveSegmentationApp:
         self.model_sessions: dict[str, object] = {}
         self.model_lock = threading.Lock()
         self.model_running = False
+        self.model_preloading = False
         self.main_zoom = 1.0
         self.main_pan_x = 0
         self.main_pan_y = 0
@@ -514,6 +521,8 @@ class InteractiveSegmentationApp:
         self._build_ui()
         self._bind_canvas()
         self._load_default_sample()
+        self.root.after(100, self._mark_ui_ready)
+        self._preload_birefnet_model()
 
     def _configure_style(self) -> None:
         style = ttk.Style(self.root)
@@ -629,18 +638,74 @@ class InteractiveSegmentationApp:
         )
 
     def _refresh_header_badges(self) -> None:
-        self.time_badge_var.set(f"⏱ {self.operation_seconds:.1f} s")
+        self.time_badge_var.set(f"⏱ {self._current_operation_seconds():.1f} s")
         self.interaction_badge_var.set(f"✦ 交互 {self.segmentation_count} 次")
         if self.image_rgb is None:
             self.canvas_state_var.set("等待图片")
         elif self.model_running:
             self.canvas_state_var.set("模型处理中")
+        elif self.model_preloading:
+            self.canvas_state_var.set("预加载中")
         elif self.result_mask is None:
             self.canvas_state_var.set("等待分割")
         elif self.pending_edits:
             self.canvas_state_var.set("待更新")
         else:
             self.canvas_state_var.set("已分割")
+
+    def _mark_ui_ready(self) -> None:
+        self.ui_ready_at = time.monotonic()
+        self._try_start_session_timer()
+        self.redraw()
+
+    def _restart_session_timer(self) -> None:
+        self.operation_seconds = 0.0
+        self.timer_reset_at = time.monotonic()
+        self.timer_start_at = None
+        self.timer_stopped_at = None
+        self._try_start_session_timer()
+
+    def _try_start_session_timer(self) -> None:
+        if self.timer_start_at is not None or self.timer_stopped_at is not None:
+            return
+        if self.ui_ready_at is None or self.model_ready_at is None:
+            return
+        self.timer_start_at = max(self.timer_reset_at, self.ui_ready_at, self.model_ready_at)
+        self.operation_seconds = 0.0
+        self._schedule_timer_update()
+
+    def _current_operation_seconds(self) -> float:
+        if self.timer_start_at is None:
+            return self.operation_seconds
+        if self.timer_stopped_at is not None:
+            return self.operation_seconds
+        return max(0.0, time.monotonic() - self.timer_start_at)
+
+    def _sync_operation_seconds(self) -> float:
+        self.operation_seconds = self._current_operation_seconds()
+        return self.operation_seconds
+
+    def _stop_session_timer(self) -> None:
+        self._sync_operation_seconds()
+        self.timer_stopped_at = time.monotonic()
+        if self.timer_update_job is not None:
+            try:
+                self.root.after_cancel(self.timer_update_job)
+            except tk.TclError:
+                pass
+            self.timer_update_job = None
+        self._refresh_header_badges()
+
+    def _schedule_timer_update(self) -> None:
+        if self.timer_update_job is None and self.timer_start_at is not None and self.timer_stopped_at is None:
+            self.timer_update_job = self.root.after(250, self._update_running_timer)
+
+    def _update_running_timer(self) -> None:
+        self.timer_update_job = None
+        if self.timer_start_at is None or self.timer_stopped_at is not None:
+            return
+        self._refresh_header_badges()
+        self._schedule_timer_update()
 
     def _build_ui(self) -> None:
         self._configure_style()
@@ -986,7 +1051,7 @@ class InteractiveSegmentationApp:
         self.segmentation_count = 0
         self.mark_count = 0
         self.pending_edits = False
-        self.operation_seconds = 0.0
+        self._restart_session_timer()
         self.main_zoom = 1.0
         self.main_pan_x = 0
         self.main_pan_y = 0
@@ -1021,7 +1086,7 @@ class InteractiveSegmentationApp:
         self.segmentation_count = 0
         self.mark_count = 0
         self.pending_edits = False
-        self.operation_seconds = 0.0
+        self._restart_session_timer()
         self.drag_started_at = None
         self.polygon_started_at = None
         self.action_grabcut_before = None
@@ -1063,7 +1128,7 @@ class InteractiveSegmentationApp:
             self.pending_visual_marks.fill(255)
         self.mark_undo_stack.clear()
         self._record_operation_seconds(started_at)
-        elapsed = self.operation_seconds
+        elapsed = self._current_operation_seconds()
         extra = "\n已自动扩展初始涂抹区域" if expanded_initial else ""
         self.status_var.set(f"分割完成\n操作时间: {elapsed:.1f}s\n交互次数: {self.segmentation_count}{extra}")
         self.redraw()
@@ -1114,6 +1179,40 @@ class InteractiveSegmentationApp:
 
     def model_matting_segment(self) -> None:
         self._start_model_matting("birefnet-general", "BiRefNet")
+
+    def _preload_birefnet_model(self) -> None:
+        if "birefnet-general" in self.model_sessions or self.model_preloading:
+            if "birefnet-general" in self.model_sessions and self.model_ready_at is None:
+                self.model_ready_at = time.monotonic()
+                self._try_start_session_timer()
+            return
+        self.model_preloading = True
+        self.status_var.set("正在预加载 BiRefNet...")
+        self.redraw()
+        worker = threading.Thread(target=self._preload_birefnet_worker, daemon=True)
+        worker.start()
+
+    def _preload_birefnet_worker(self) -> None:
+        try:
+            from rembg import new_session
+
+            with self.model_lock:
+                if "birefnet-general" not in self.model_sessions:
+                    self.model_sessions["birefnet-general"] = new_session("birefnet-general")
+        except Exception as exc:
+            self.root.after(0, self._finish_birefnet_preload, False, str(exc))
+            return
+        self.root.after(0, self._finish_birefnet_preload, True, "")
+
+    def _finish_birefnet_preload(self, success: bool, message: str) -> None:
+        self.model_preloading = False
+        self.model_ready_at = time.monotonic()
+        self._try_start_session_timer()
+        if success:
+            self.status_var.set("BiRefNet 已预加载")
+        else:
+            self.status_var.set(f"BiRefNet 预加载失败\n{message}")
+        self.redraw()
 
     def _start_model_matting(self, model_name: str, display_name: str) -> None:
         if self.image_rgb is None or self.grabcut_mask is None:
@@ -1288,6 +1387,7 @@ class InteractiveSegmentationApp:
         if self.image_rgb is None or self.image_path is None:
             messagebox.showinfo("提示", "请先读取图像")
             return
+        self._stop_session_timer()
         if self.result_mask is None or self.pending_edits:
             self.segment()
             if self.result_mask is None:
@@ -1323,6 +1423,7 @@ class InteractiveSegmentationApp:
         if self.image_rgb is None or self.image_path is None:
             messagebox.showinfo("提示", "请先读取图像")
             return
+        self._stop_session_timer()
         if self.result_mask is None or self.pending_edits:
             self.segment()
             if self.result_mask is None:
@@ -1522,9 +1623,11 @@ class InteractiveSegmentationApp:
     def _record_operation_seconds(self, started_at: float | None) -> None:
         if started_at is None:
             return
-        self.operation_seconds += max(0.0, time.monotonic() - started_at)
+        # 当前版本使用连续会话计时，这里只同步显示值，避免每次操作重复叠加时间。
+        self._sync_operation_seconds()
 
     def _snapshot_action_masks(self) -> None:
+        self._sync_operation_seconds()
         self.action_grabcut_before = None if self.grabcut_mask is None else self.grabcut_mask.copy()
         self.action_visual_before = None if self.visual_marks is None else self.visual_marks.copy()
         self.action_result_before = None if self.result_mask is None else self.result_mask.copy()
@@ -1601,7 +1704,7 @@ class InteractiveSegmentationApp:
         self.pending_edits = state.pending_edits
         self.segmentation_count = state.segmentation_count
         self.mark_count = state.mark_count
-        self.operation_seconds = state.operation_seconds
+        self._sync_operation_seconds()
         self.status_var.set("已撤销上一次标记")
         self.redraw()
 
